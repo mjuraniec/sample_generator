@@ -6,9 +6,11 @@ import random
 import re
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from urllib.parse import urljoin
 
 from faker import Faker
 from jsonref import JsonRef, jsonloader, replace_refs
+from jsonschema import Draft202012Validator
 from proxytypes import LazyProxy
 
 from .DefaultValueGenerator import DefaultValueGenerator
@@ -96,6 +98,77 @@ def _json_key(value: Any) -> Any:
             tuple(sorted((str(k), _json_key(v)) for k, v in value.items())),
         )
     return ("other", repr(value))
+
+
+def _schema_name(ref: Any) -> Optional[str]:
+    """The name of the schema the ``$ref`` *ref* points at when it is a
+    named one (``#/components/schemas/Dog``, ``#/definitions/Dog``,
+    ``#/$defs/Dog``), else ``None``."""
+    if not isinstance(ref, str) or "#" not in ref:
+        return None
+    segments = ref.rsplit("#", 1)[-1].strip("/").split("/")
+    named = segments[-3:-1] == ["components", "schemas"] or (
+        len(segments) >= 2 and segments[-2] in ("definitions", "$defs")
+    )
+    if not named or not segments[-1]:
+        return None
+    return segments[-1].replace("~1", "/").replace("~0", "~")
+
+
+def _refers_to(target: Any, branch: Any) -> bool:
+    """True when *target*, a ``discriminator.mapping`` value (a reference
+    or a bare schema name), names the schema the :class:`JsonRef` *branch*
+    points at. A reference is resolved against the branch's base URI, so
+    ``#/definitions/Pet`` of two documents are two schemas."""
+    if not isinstance(branch, JsonRef) or not isinstance(target, str):
+        return False
+    ref = branch.__reference__.get("$ref")
+    if not isinstance(ref, str) or not ref or not target:
+        return False
+    if "/" not in target and "#" not in target:
+        return target == _schema_name(ref)
+    try:
+        # the proxy forwards attribute lookups to the schema it stands for
+        base = object.__getattribute__(branch, "base_uri") or ""
+    except AttributeError:
+        base = ""
+    return urljoin(base, target) == urljoin(base, ref)
+
+
+def _discriminator_name(
+    parent: Any, selected: Any, preferred: Optional[str] = None
+) -> Optional[Tuple[str, str]]:
+    """The ``discriminator.propertyName`` of *parent* and the value that
+    names the *selected* branch: its key in ``discriminator.mapping`` (the
+    *preferred* key, the one a selector named it by, when several refer to
+    it), else the name of the named schema its ``$ref`` points at
+    (OpenAPI's implicit mapping). An inline branch is named only by a
+    mapping that refers to its ``title``. ``None`` when there is no
+    discriminator or no name."""
+    disc = parent.get("discriminator") if isinstance(parent, dict) else None
+    if not isinstance(disc, dict):
+        return None
+    prop = disc.get("propertyName")
+    if not isinstance(prop, str) or not prop:
+        return None
+    mapping = disc.get("mapping")
+    if not isinstance(mapping, dict):
+        mapping = {}
+    keys = list(mapping)
+    if preferred in mapping:
+        keys.insert(0, preferred)
+    if isinstance(selected, JsonRef):
+        for key in keys:
+            if _refers_to(mapping[key], selected):
+                return prop, key
+        name = _schema_name(selected.__reference__.get("$ref"))
+        return None if name is None else (prop, name)
+    title = selected.get("title") if isinstance(selected, dict) else None
+    if isinstance(title, str):
+        for key in keys:
+            if str(mapping[key]).rsplit("/", 1)[-1] == title:
+                return prop, key
+    return None
 
 
 # Keywords next to a oneOf/anyOf that do not constrain the instance and
@@ -519,7 +592,10 @@ class JSONSchemaGenerator:
         """
         parent = ctx.schema_data
         schemas = parent.get(kind, [])
-        selected = self._resolve_variant(ctx, schemas, scenario, kind)
+        named_by: List[str] = []
+        selected = self._resolve_variant(
+            ctx, schemas, scenario, kind, named_by=named_by
+        )
 
         siblings = {
             k: v
@@ -528,21 +604,25 @@ class JSONSchemaGenerator:
             and k not in _VARIANT_ANNOTATIONS
             and not k.startswith("x-")
         }
+        own = self.allof_merger({"allOf": [selected]})
         if not siblings:
             # Recurse into the branch itself (keeps $ref identity and
             # schema_path), still leaving out what only the other oneOf
             # branches require.
             excluded = ctx.excluded_properties
             if kind == "oneOf":
-                flat = self.allof_merger({"allOf": [selected]})
                 excluded = excluded + self._required_only_elsewhere(
-                    schemas, selected, flat if isinstance(flat, dict) else {}
+                    schemas, selected, own if isinstance(own, dict) else {}
                 )
-            return self._generate_node(
+            naming = self._branch_name(
+                ctx, selected, own, own, named_by, scenario, builder
+            )
+            result = self._generate_node(
                 ctx.copy(schema_data=selected, excluded_properties=excluded),
                 scenario,
                 builder,
             )
+            return self._name_branch(naming, result, builder)
 
         merged = self.allof_merger({"allOf": [siblings, selected]})
         excluded = ctx.excluded_properties
@@ -550,6 +630,9 @@ class JSONSchemaGenerator:
             excluded = excluded + self._required_only_elsewhere(
                 schemas, selected, merged
             )
+        naming = self._branch_name(
+            ctx, selected, own, merged, named_by, scenario, builder
+        )
 
         updates: Dict[str, Any] = {
             "schema_data": merged,
@@ -558,7 +641,79 @@ class JSONSchemaGenerator:
         }
         if isinstance(selected, JsonRef):
             updates["schema_path"] = selected.__reference__["$ref"]
-        return self._generate_node(ctx.copy(**updates), scenario, builder)
+        result = self._generate_node(ctx.copy(**updates), scenario, builder)
+        return self._name_branch(naming, result, builder)
+
+    def _branch_name(
+        self,
+        ctx: Context,
+        selected: Any,
+        own: Any,
+        flat: Any,
+        named_by: List[str],
+        scenario: Scenario,
+        builder: SchemaGeneratorBuilder,
+    ) -> Optional[Tuple[str, str]]:
+        """Where and what :meth:`_name_branch` writes once the *selected*
+        branch is generated: the parent's ``discriminator.propertyName``
+        and the value that names the branch (see
+        :func:`_discriminator_name`; a ``str`` selector's key first).
+        *own* is the branch alone and *flat* the branch as generated, each
+        with ``allOf`` merged.
+
+        ``None``, leaving the property as generated, when the branch pins
+        it itself (``const`` or ``enum``), when the branch is polymorphic
+        in turn (its own ``oneOf``/``anyOf`` names the concrete type), when
+        the value would not validate against the property's schema, or
+        when the scenario or ``default_data`` sets the property.
+        """
+        named = _discriminator_name(
+            ctx.schema_data, selected, named_by[0] if named_by else None
+        )
+        if named is None or not isinstance(flat, dict):
+            return None
+        if not isinstance(own, dict):
+            return None
+        if any(k in part for part in (own, flat) for k in ("oneOf", "anyOf")):
+            return None
+        prop, value = named
+        props = flat.get("properties")
+        if not isinstance(props, dict) or prop not in props:
+            return None
+        pinned = (own.get("properties") or {}).get(prop)
+        if pinned is not None:
+            pinned = self.allof_merger({"allOf": [pinned]})
+            if isinstance(pinned, dict) and (
+                "const" in pinned or "enum" in pinned
+            ):
+                return None
+        try:
+            if not Draft202012Validator(props[prop]).is_valid(value):
+                return None
+        except Exception:
+            return None
+        path = join_path(ctx.prop_path, prop)
+        if self._scenario_defined(path, scenario):
+            return None
+        if builder.has_value_at_path(path):
+            return None
+        return path, value
+
+    @staticmethod
+    def _name_branch(
+        naming: Optional[Tuple[str, str]],
+        result: Any,
+        builder: SchemaGeneratorBuilder,
+    ) -> Any:
+        """Replace the discriminator value the branch was generated with by
+        the one that names it (*naming*, from :meth:`_branch_name`).
+        Nothing is added: a property the generator left out (optional in
+        ``minimal_mode`` or on a cycle, excluded by ``oneOf``, not covered
+        in ``scenario_only`` mode) stays out, and the random draws are the
+        ones made without a discriminator."""
+        if naming is not None and builder.has_value_at_path(naming[0]):
+            builder.set_value_at_path(naming[0], naming[1])
+        return result
 
     def _required_only_elsewhere(
         self, schemas: List[Any], selected: Any, merged: Dict[str, Any]
@@ -586,6 +741,7 @@ class JSONSchemaGenerator:
         schemas: List[Dict[str, Any]],
         scenario: Scenario,
         kind: str,
+        named_by: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Pick one branch from a oneOf/anyOf candidate list.
 
@@ -596,8 +752,11 @@ class JSONSchemaGenerator:
         Selector return values:
           * ``int`` — index into ``schemas`` (``bool`` rejected).
           * ``str`` — resolved against candidate ``title``, then the
-            OpenAPI discriminator value (mapping key or the const/enum/
-            default of the property named by ``discriminator.propertyName``).
+            OpenAPI discriminator value (mapping key, a ``$ref`` branch by
+            the reference it was written with, or the const/enum/default
+            of the property named by ``discriminator.propertyName``), then
+            the name of the schema a ``$ref`` branch refers to. The string
+            is appended to *named_by*.
           * ``dict`` — taken as the selected schema fragment.
         """
         if not schemas:
@@ -635,6 +794,8 @@ class JSONSchemaGenerator:
                 )
             return schemas[sel_res]
         if isinstance(sel_res, str):
+            if named_by is not None:
+                named_by.append(sel_res)
             return self._resolve_variant_by_name(sel_res, schemas, ctx, kind)
         if isinstance(sel_res, dict):
             return sel_res
@@ -725,8 +886,11 @@ class JSONSchemaGenerator:
             for s in schemas:
                 if not isinstance(s, dict):
                     continue
-                # Schemas may still carry a $ref (jsonref inlined) — check
-                # either the raw ref or a title match on the referenced name.
+                # A $ref branch is a resolved JsonRef: compare the ref it
+                # was written with. Schemas may still carry a raw $ref, or
+                # match by a title on the referenced name.
+                if _refers_to(target_ref, s):
+                    return s
                 if s.get("$ref") == target_ref:
                     return s
                 # Fall back to matching by the last path segment of the ref.
@@ -748,6 +912,13 @@ class JSONSchemaGenerator:
                     return s
                 enum = prop.get("enum")
                 if isinstance(enum, list) and name in enum:
+                    return s
+
+        # 2c. OpenAPI's implicit mapping: the name of the schema a $ref
+        # branch refers to (with a discriminator only)
+        if disc is not None and "/" not in name and "#" not in name:
+            for s in schemas:
+                if _refers_to(name, s):
                     return s
 
         # Build a helpful error listing what was available.

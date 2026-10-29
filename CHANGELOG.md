@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [Unreleased]
+
+### Fixed
+
+- With an OpenAPI `discriminator` next to `oneOf`/`anyOf`, the property it
+  names gets the value that names the generated branch: its key in
+  `discriminator.mapping`, or, for a `$ref` branch the mapping does not
+  list, the name of the schema it refers to. It was a random string that
+  matched neither unless the branches pinned it with `const` or `enum`,
+  which still wins, as does a polymorphic branch's own level. Only the
+  value the branch was generated with is replaced: no property is added
+  and every other value stays the same. This needs the `$ref`s, so it
+  does not apply to a schema loaded with `Schema.from_oas` or
+  `Schema.from_raw_data` (issue #15).
+- A `str` selector finds a `$ref` branch through `discriminator.mapping`,
+  comparing the reference the branch was written with (resolved, so two
+  documents' `#/definitions/Pet` differ), and with a discriminator also by
+  the name of the schema it refers to; it raised "no candidate matched"
+  unless the schema had a `title`. The same limit applies (issue #15).
+
 ## [0.6.0] - 2026-10-21
 
 Addresses the nine issues reported against 0.5.0, referenced below as

@@ -117,7 +117,7 @@ scenario = Scenario(
 | Return type | Behaviour |
 |---|---|
 | `int` | Selects the candidate at that index (bounds-checked, `bool` rejected). |
-| `str` | Matched against each candidate's `title`, then the OpenAPI `discriminator` mapping, then `properties[propertyName].const/enum/default`. Raises `ValueError` on no match. |
+| `str` | Matched against each candidate's `title`, then the OpenAPI `discriminator` mapping (a `$ref` branch by the reference it was written with), then `properties[propertyName].const/enum/default`, then, with a discriminator, the name of the schema a `$ref` branch refers to (OpenAPI's implicit mapping). A schema loaded with `Schema.from_oas` or `Schema.from_raw_data` has no `$ref` branches left. Raises `ValueError` on no match. |
 | `dict` | Taken as the selected schema fragment directly. |
 
 ```python
@@ -183,6 +183,28 @@ A parent that holds nothing but the branch list and annotations
 (`discriminator`, `title`, `description`, ...) is generated from the
 branch alone, so `$ref` branches keep their `schema_path`; the properties
 that only the other `oneOf` branches require are left out there too.
+
+With an OpenAPI `discriminator`, the property it names is set to the
+value that names the chosen branch: the branch's key in
+`discriminator.mapping` (the key a `str` selector gave, when several refer
+to the branch), or, for a branch the mapping does not list, the name of
+the schema its `$ref` points at (`#/components/schemas/Dog` gives `Dog`,
+as OpenAPI's implicit mapping does). The branch is generated as without
+a discriminator, and only then the value it got for the property is
+replaced, so no property appears that would not have otherwise (an
+optional one in `minimal_mode` or on a cycle, one that only the other
+`oneOf` branches require, one `scenario_only` does not cover) and every
+other value is the same. The value is left as generated when the branch
+pins the property with its own `const` or `enum`, when the branch is
+polymorphic in turn (its own `oneOf`/`anyOf`, whose level names the
+concrete type), when the value would not validate against the
+property's schema, and when an override or `default_data` sets it. An
+inline branch is named only through a mapping that refers to its
+`title`. A schema loaded with `Schema.from_oas` or `Schema.from_raw_data`
+has its `$ref`s resolved, so its branches have no name to give, for the
+value nor for a `str` selector: pin the property with `const` in each
+branch (strict OpenAPI variants do), or load the document with
+`Schema(data=..., base_uri=...)`.
 
 
 ## Reusing and composing scenarios
