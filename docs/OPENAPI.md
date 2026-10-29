@@ -103,6 +103,10 @@ Schema.from_oas(
 
 The key insight: resolve first in full context, then extract. This is the opposite of extracting first and then trying to resolve (which fails).
 
+### Recursive components
+
+A component that refers to itself, directly or through others (a `QuoteItem` holding a list of `QuoteItem`), resolves to a structure that contains itself. `JSONSchemaGenerator` accepts it: `Schema.from_oas` records which schemas are the document's components, and the generator writes the structure back with a `$ref` to each, as the document has them, before resolving it. The component then generates the same samples as the unresolved document with that component as its root, and the recursion ends through the cycle rule described in the README ("Recursion, nesting depth and `uniqueItems`"). The break enumerators and `SampleBreaker` read the resolved structure as it is.
+
 ## Complete Example
 
 ```python

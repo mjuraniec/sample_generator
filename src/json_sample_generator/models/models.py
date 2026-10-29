@@ -5,7 +5,7 @@ import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 from jsonref import jsonloader, replace_refs
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 # Define a type for scenario override functions
 ScenarioOverrideFn = Callable[["Context"], Any]
@@ -104,6 +104,10 @@ class Scenario(BaseModel):
 class Schema(BaseModel):
     data: Dict[Any, Any]
     base_uri: Optional[str] = None
+    # Set by from_oas: each resolved component schema in data, with its
+    # name, so that JSONSchemaGenerator can write a recursive schema back
+    # as the document wrote it (see _as_references there).
+    _components: List[Tuple[Any, str]] = PrivateAttr(default_factory=list)
 
     @staticmethod
     def from_raw_data(raw: Dict[str, Any], base_uri: str) -> Schema:
@@ -183,10 +187,18 @@ class Schema(BaseModel):
                 f"Schema '{name}' not found in components/schemas "
                 "of the OAS document."
             )
-        return Schema(
+        schema = Schema(
             data=dict(schema_data),
             base_uri=f"{base_uri}#/components/schemas/{name}",
         )
+        schema._components = [
+            (component, component_name)
+            for component_name, component in resolved["components"][
+                "schemas"
+            ].items()
+            if isinstance(component, dict)
+        ]
+        return schema
 
 
 class Context(BaseModel):

@@ -5,7 +5,17 @@ import math
 import random
 import re
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    cast,
+)
 
 from faker import Faker
 from jsonref import JsonRef, jsonloader, replace_refs
@@ -98,6 +108,215 @@ def _json_key(value: Any) -> Any:
     return ("other", repr(value))
 
 
+def _subject(node: Any) -> Any:
+    """The schema a :class:`JsonRef` stands for, else *node* itself; a
+    reference that cannot be resolved is treated as a leaf (``None``)."""
+    if isinstance(node, JsonRef):
+        try:
+            return node.__subject__
+        except Exception:
+            return None
+    return node
+
+
+def _contains_itself(data: Any) -> bool:
+    """True when a dict or list in *data* contains itself, directly or
+    through a :class:`JsonRef`. That is how ``Schema.from_oas`` and
+    ``Schema.from_raw_data`` hand over a recursive ``$ref``: resolved up
+    front, as a structure that refers back to itself."""
+    finished: Set[int] = set()
+    on_path: Set[int] = set()
+    stack: List[Tuple[Any, bool]] = [(data, False)]
+    while stack:
+        node, leaving = stack.pop()
+        if leaving:
+            on_path.discard(id(node))
+            finished.add(id(node))
+            continue
+        node = _subject(node)
+        if not isinstance(node, (dict, list)):
+            continue
+        if id(node) in on_path:
+            return True
+        if id(node) in finished:
+            continue
+        on_path.add(id(node))
+        stack.append((node, True))
+        children = node.values() if isinstance(node, dict) else node
+        stack.extend((child, False) for child in children)
+    return False
+
+
+def _holds_ref(data: Any) -> bool:
+    """True when *data* still holds a ``{"$ref": "..."}`` to resolve."""
+    seen: Set[int] = set()
+    stack: List[Any] = [data]
+    while stack:
+        node = _subject(stack.pop())
+        if not isinstance(node, (dict, list)) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        if isinstance(node, dict):
+            if isinstance(node.get("$ref"), str):
+                return True
+            stack.extend(node.values())
+        else:
+            stack.extend(node)
+    return False
+
+
+# Where _as_references writes the schemas a resolved schema shares.
+_SHARED_KEY = "x-sample-generator-shared"
+
+
+class _Unbroken(Exception):
+    """A cycle that no ``$ref`` breaks: it passes through no shared dict."""
+
+
+def _is_root_ref(node: Any, target: Any, root: Any) -> bool:
+    """True for a :class:`JsonRef` written ``{"$ref": "#"}`` to *root*."""
+    return target is root and node.__reference__.get("$ref") == "#"
+
+
+def _walk_once(
+    root: Any,
+) -> Tuple[Dict[int, Any], Dict[int, int], Set[int], bool]:
+    """Every dict and list reachable from *root*, ``JsonRef`` subjects
+    included, by ``id``; how often each is reached other than through a
+    ``JsonRef``; the ids of the ``JsonRef`` subjects (a ``"#"`` to *root*
+    aside); and whether any ``JsonRef`` was met."""
+    walked: Dict[int, Any] = {}
+    reached: Dict[int, int] = {}
+    referred: Set[int] = set()
+    any_ref = False
+    stack: List[Tuple[Any, bool]] = [(root, False)]
+    while stack:
+        node, by_ref = stack.pop()
+        if isinstance(node, JsonRef):
+            any_ref = True
+            target = _subject(node)
+            if target is None:
+                continue
+            if not _is_root_ref(node, target, root):
+                referred.add(id(target))
+            stack.append((target, True))
+            continue
+        if not isinstance(node, (dict, list)):
+            continue
+        if not by_ref:
+            reached[id(node)] = reached.get(id(node), 0) + 1
+        if id(node) in walked:
+            continue
+        walked[id(node)] = node
+        children = node.values() if isinstance(node, dict) else node
+        stack.extend((child, False) for child in children)
+    return walked, reached, referred, any_ref
+
+
+def _as_references(
+    data: Dict[Any, Any], components: Sequence[Tuple[Any, str]] = ()
+) -> Optional[Dict[Any, Any]]:
+    """*data*, a schema that contains itself, written back as a tree of
+    ``$ref``, the way it was written before it was resolved: each schema
+    it refers to is written once and referred to wherever it occurs, and
+    the root is written in place, as the root of a document is.
+
+    Where *data* still holds its ``JsonRef``s (``Schema.from_raw_data``),
+    each becomes a ``$ref`` again, ``"#"`` one too. *components* are the
+    component schemas ``Schema.from_oas`` resolved, with their names:
+    those are written under ``components/schemas`` and referred to as
+    ``#/components/schemas/<name>``, as in the document. Anything else
+    reached more than once is written under ``_SHARED_KEY``; and when
+    nothing tells what was referred to, every ``allOf`` is taken for a
+    referred component, so that inheritance keeps its meaning. ``None``
+    when a cycle passes through no such dict."""
+    walked, _, _, _ = _walk_once(data)
+    # Schema.from_oas and pydantic hand the root over as a shallow copy of
+    # the schema the references point at: start from that schema, so the
+    # dicts and lists the two share do not count as shared.
+    root: Dict[Any, Any] = data
+    for node in walked.values():
+        if (
+            node is not data
+            and isinstance(node, dict)
+            and len(node) == len(data)
+            and all(k in node and node[k] is v for k, v in data.items())
+        ):
+            root = node
+            break
+    walked, reached, referred, any_ref = _walk_once(root)
+    known = {id(c): name for c, name in components if walked.get(id(c)) is c}
+    referred_to = {
+        key
+        for key, node in walked.items()
+        if key in referred
+        or (isinstance(node, dict) and reached.get(key, 0) > 1)
+    }
+    named = referred_to | (set(known) - {id(root)})
+    if not any_ref and not known:
+        named |= {
+            key
+            for key, node in walked.items()
+            if node is not root and isinstance(node, dict) and "allOf" in node
+        }
+    if id(root) in referred_to:
+        named.add(id(root))
+
+    shared_key = _SHARED_KEY
+    while shared_key in root:
+        shared_key += "_"
+    in_components = "components" not in root
+    order = [k for k in walked if k in named]
+    names: Dict[int, str] = {}
+    for i, k in enumerate(order):
+        if k in known and in_components:
+            escaped = known[k].replace("~", "~0").replace("/", "~1")
+            names[k] = f"#/components/schemas/{escaped}"
+        else:
+            names[k] = f"#/{shared_key}/{i}"
+
+    on_path: Set[int] = set()
+
+    def write(node: Any, body: bool = False) -> Any:
+        if isinstance(node, JsonRef):
+            target = _subject(node)
+            if target is None:
+                return node
+            if _is_root_ref(node, target, root):
+                return {"$ref": "#"}
+            return {"$ref": names[id(target)]}
+        if not isinstance(node, (dict, list)):
+            return node
+        if not body and id(node) in names:
+            return {"$ref": names[id(node)]}
+        if id(node) in on_path:
+            raise _Unbroken()
+        on_path.add(id(node))
+        try:
+            if isinstance(node, dict):
+                return {k: write(v) for k, v in node.items()}
+            return [write(v) for v in node]
+        finally:
+            on_path.discard(id(node))
+
+    try:
+        tree = write(root, body=True)
+        definitions = {k: write(walked[k], body=True) for k in order}
+    except _Unbroken:
+        return None
+    for k, definition in definitions.items():
+        if names[k].startswith("#/components/schemas/"):
+            schemas = tree.setdefault("components", {}).setdefault(
+                "schemas", {}
+            )
+            schemas[known[k]] = definition
+        else:
+            tree.setdefault(shared_key, {})[
+                names[k].rsplit("/", 1)[-1]
+            ] = definition
+    return tree
+
+
 # Keywords next to a oneOf/anyOf that do not constrain the instance and
 # therefore need not be merged into the chosen branch. Vendor extensions
 # (``x-...``) are treated the same way.
@@ -141,8 +360,22 @@ class JSONSchemaGenerator:
         loader=jsonloader,
         generator_max_items: Optional[int] = None,
     ):
+        # Schema.from_oas and Schema.from_raw_data resolve every $ref up
+        # front, so a recursive one arrives as a structure that contains
+        # itself, which replace_refs, walking it as a tree, would never
+        # finish. Such a schema is written back as $refs first, and is then
+        # generated the way the same schema written with $ref is.
+        data = schema.data
+        shared = (
+            _as_references(data, schema._components)
+            if _contains_itself(data) and not _holds_ref(data)
+            else None
+        )
         self.schema = Schema(
-            data=cast(Dict[Any, Any], copy.deepcopy(schema.data)),
+            data=cast(
+                Dict[Any, Any],
+                copy.deepcopy(data if shared is None else shared),
+            ),
             base_uri=schema.base_uri,
         )
         self.max_depth = max_depth
@@ -153,6 +386,10 @@ class JSONSchemaGenerator:
             if self.schema.base_uri is not None
             else "file://dummy.json"
         )
+        if shared is not None:
+            # Its references are local, and jsonref resolves a local one
+            # only against a base URI without a fragment.
+            uri = uri.split("#", 1)[0]
 
         loaded = replace_refs(self.schema.data, base_uri=uri, loader=loader)
         # Ensure schema.data is a dictionary after replacing references

@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [Unreleased]
+
+### Fixed
+
+- `JSONSchemaGenerator` generates from a recursive schema loaded by
+  `Schema.from_oas` or `Schema.from_raw_data`, where it raised
+  `RecursionError`. Both loaders resolve every `$ref` up front, so a
+  recursive one arrives as a structure that contains itself; the generator
+  now writes it back as `$ref`s before resolving it, the way the document
+  wrote them: `Schema.from_oas` records which schemas are its components
+  (a private attribute of `Schema`), and `Schema.from_raw_data` keeps its
+  references. A component from `Schema.from_oas` generates the same samples
+  as the unresolved document with that component as its root, and a schema
+  from `Schema.from_raw_data` the same as the schema it was loaded from.
+  Any other schema is resolved as before (issue #16).
+
 ## [0.6.0] - 2026-10-21
 
 Addresses the nine issues reported against 0.5.0, referenced below as
