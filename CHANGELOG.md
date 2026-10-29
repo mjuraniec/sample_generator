@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [Unreleased]
+
+### Fixed
+
+- `SampleBreaker` resolves a property inside a `oneOf`/`anyOf` branch
+  that is itself an `allOf`, the way strict OpenAPI variants write a
+  polymorphic reference; it found no schema there, so a `wrong_type`
+  break replaced a string with another string. At every level of the
+  path it now merges `allOf`, picks the branch whose types, `const` and
+  `enum` values (and, for an array, `items`) agree with the sample, and
+  merges it with the keywords next to the `oneOf` as the generator does;
+  the kinds that read the schema read that fragment. A `wrong_type` value
+  is of a type that no branch, `type` list or `nullable` accepts (an
+  integer counts as a `number`); a schema that does not restrict the type
+  gets a string, as before (issue #17).
+
 ## [0.6.0] - 2026-10-21
 
 Addresses the nine issues reported against 0.5.0, referenced below as

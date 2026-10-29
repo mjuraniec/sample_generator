@@ -36,7 +36,7 @@ that caused it.
 
 | `BreakKind` value         | What it does                                                         |
 | ------------------------- | -------------------------------------------------------------------- |
-| `wrong_type`              | Replace the value with a value of a different type                   |
+| `wrong_type`              | Replace the value with a value of a type the schema does not accept there (no `oneOf`/`anyOf` branch, `type` list or `nullable` does); a value whose schema does not restrict its type gets a string, as before |
 | `remove_required`         | Delete the key (triggers a `required` error on the parent)           |
 | `null_value`              | Replace the value with `null`                                        |
 | `enum_violation`          | Replace with a value not in `enum`                                   |
@@ -295,6 +295,20 @@ When `apply_break_scenario` encounters a rule whose path does not exist
 in the sample (the branch was not taken), it silently **no-ops** that
 rule. Use `validate_breaks` to detect no-ops: rules that triggered no
 validation errors indicate a path mismatch.
+
+Where the path does exist, the breaker reads the schema of the branch
+the sample took. At every level of the path it merges `allOf`, picks the
+`oneOf`/`anyOf` branch whose types, `const` and `enum` values agree with
+the sample (then, for an object, the one whose required keys and
+properties it has most of; for an array, the one whose `items` its
+elements fit), and merges that branch with the keywords next to the
+`oneOf`, as the generator merges them. Every kind that reads the schema
+reads that fragment; `wrong_type` looks at every branch. A branch that is itself an `allOf`, as strict
+OpenAPI variants write a polymorphic reference, is resolved the same
+way. A rule taken from another branch can still have no effect on a
+sample whose path exists: a `minItems` that only the other branch sets,
+or a `const` of one `anyOf` branch whose break another branch accepts,
+for example.
 
 ---
 
