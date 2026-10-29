@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 
 The format is based on Keep a Changelog.
 
+## [Unreleased]
+
+### Added
+
+- `ValidationFailure.unchecked_format` and `ValidationFailure.checked`: a
+  `format_violation` of a format the validator cannot check (`url`, which
+  JSON Schema does not define, or any other format it does not know, such
+  as one whose checker package is missing) is reported as unchecked
+  instead of as a break that had no effect (issue #18).
+
+### Fixed
+
+- `validate_breaks` sees a `format_violation` at `date-time`, `uri` and
+  `hostname`: jsonschema checks those only with `rfc3339-validator`,
+  `rfc3986-validator` and `fqdn` installed, which are now dependencies
+  (`rfc3339-validator` moves from the dev group). It checks `time` as
+  draft 2020-12 does: `jsonschema.FormatChecker()`, used before, checks
+  it the draft 3 way and rejected a valid RFC 3339 time such as
+  `12:00:00Z`, so a rule near one could match an error that was not its
+  own. Formats registered with `FormatChecker` are still checked (issue
+  #18).
+
 ## [0.6.0] - 2026-10-21
 
 Addresses the nine issues reported against 0.5.0, referenced below as

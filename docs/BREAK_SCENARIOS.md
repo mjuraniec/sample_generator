@@ -262,8 +262,12 @@ the breaks actually triggered `jsonschema` errors at runtime.
 
 `validate_breaks` runs `jsonschema.Draft202012Validator` on the broken
 sample and maps each validation error to the `BreakRule` whose path
-matches. It uses a `FormatChecker` so `format_violation` breaks are
-also detected.
+matches. It checks formats the way that draft defines them, so
+`format_violation` breaks are detected too: `email`, `date`, `ipv4`,
+`ipv6` and `uuid` with jsonschema alone, `date-time` and `time` through
+`rfc3339-validator`, `uri` through `rfc3986-validator` and `hostname`
+through `fqdn`, which this package requires for that reason. A format
+registered with jsonschema's `FormatChecker` is checked as well.
 
 ```python
 from json_sample_generator import validate_breaks
@@ -275,13 +279,20 @@ for f in failures:
         print(f"Rule {f.rule.path!r} ({f.rule.kind.value}) triggered:")
         for err in f.matched_errors:
             print(f"  {err.message}")
+    elif not f.checked:
+        print(f"Rule {f.rule.path!r}: {f.unchecked_format} is not checked")
     else:
         print(f"Rule {f.rule.path!r} had no effect (path unreachable?)")
 ```
 
 A rule with `matched=False` usually means the break's path did not
 exist in the sample — for example, a `oneOf` branch that was not
-selected. This is a signal, not an error.
+selected. This is a signal, not an error. The exception is a
+`format_violation` of a format the validator cannot check: `url`, which
+JSON Schema does not define, or any other format it does not know, such
+as one whose checker package is missing. That entry has `checked=False`
+and names the format in `unchecked_format`, since the break may well
+have worked.
 
 ---
 
@@ -312,7 +323,7 @@ validation errors indicate a path mismatch.
 | `merge_break_scenarios`    | function  | Combine multiple scenarios into one                             |
 | `SampleBreaker`            | class     | Stateful breaker bound to a schema                              |
 | `apply_break_scenario`     | function  | Functional shortcut for `SampleBreaker(...).apply(...)`         |
-| `ValidationFailure`        | dataclass | A rule together with the jsonschema errors it triggered         |
+| `ValidationFailure`        | dataclass | A rule, the jsonschema errors it triggered, and `unchecked_format` when its format cannot be checked |
 | `validate_breaks`          | function  | Verify a broken sample actually fails its schema                |
 | `RuleCheck`                | dataclass | Result of statically checking one rule (path + kind validity)   |
 | `BreakScenarioReport`      | dataclass | Static validation report for a whole scenario                   |

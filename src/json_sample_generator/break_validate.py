@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 import jsonschema
 
 from .break_enum import BreakSite, collect_break_sites
+from .breaker import SampleBreaker
 from .helpers.utils import path_startswith
 from .models.break_models import BreakKind, BreakRule, BreakScenario
 from .models.models import Schema
@@ -28,17 +29,36 @@ from .models.models import Schema
 
 @dataclass
 class ValidationFailure:
-    """A break rule together with the jsonschema errors it triggered."""
+    """A break rule together with the jsonschema errors it triggered.
+
+    Attributes:
+        rule: The rule that was checked.
+        matched_errors: The errors at or around the rule's path.
+        unchecked_format: For a ``format_violation`` rule that matched no
+            error, the format at its path when the validator cannot check
+            it: ``url``, which JSON Schema does not define, or any other
+            format it does not know, such as one whose checker package is
+            missing. ``matched`` is then ``False`` because the break
+            cannot be seen, not because it had no effect. ``None``
+            otherwise.
+    """
 
     rule: BreakRule
     matched_errors: List[jsonschema.ValidationError] = field(
         default_factory=list
     )
+    unchecked_format: Optional[str] = None
 
     @property
     def matched(self) -> bool:
         """``True`` when at least one validation error was matched."""
         return bool(self.matched_errors)
+
+    @property
+    def checked(self) -> bool:
+        """``False`` when the validator could not check the rule's break
+        (see :attr:`unchecked_format`)."""
+        return self.unchecked_format is None
 
 
 @dataclass
@@ -196,31 +216,64 @@ def validate_breaks(
         when at least one ``jsonschema`` error path aligns with the
         rule's path.  An unmatched entry means the break had no visible
         effect — likely because the rule's path was unreachable in the
-        sample's shape (e.g., a ``oneOf`` branch that was not selected).
+        sample's shape (e.g., a ``oneOf`` branch that was not selected) —
+        unless ``entry.checked`` is ``False``: a ``format_violation`` of a
+        format the validator cannot check (``entry.unchecked_format``).
 
     Notes
     -----
     Uses ``jsonschema.Draft202012Validator``.  The schema is used as-is
     (the caller is responsible for ref resolution when needed).
     """
+    format_checker = _format_checker()
     validator = jsonschema.Draft202012Validator(
         schema.data,
-        format_checker=jsonschema.FormatChecker(),
+        format_checker=format_checker,
     )
     all_errors: List[jsonschema.ValidationError] = list(
         validator.iter_errors(broken_sample)
     )
 
+    breaker: Optional[SampleBreaker] = None
     results: List[ValidationFailure] = []
     for rule in scenario.rules:
         matched = _match_errors(rule, all_errors)
-        results.append(ValidationFailure(rule=rule, matched_errors=matched))
+        unchecked: Optional[str] = None
+        if not matched and rule.kind == BreakKind.FORMAT_VIOLATION:
+            # The format the breaker broke there, read as it reads it.
+            breaker = breaker or SampleBreaker(schema)
+            try:
+                fmt = breaker._resolve_schema(broken_sample, rule.path).get(
+                    "format"
+                )
+            except ValueError:
+                fmt = None  # a path parse_path cannot read
+            if isinstance(fmt, str) and fmt not in format_checker.checkers:
+                unchecked = fmt
+        results.append(
+            ValidationFailure(
+                rule=rule, matched_errors=matched, unchecked_format=unchecked
+            )
+        )
     return results
 
 
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
+
+
+def _format_checker() -> jsonschema.FormatChecker:
+    """Draft 2020-12's format checks, with any other format
+    ``jsonschema.FormatChecker()`` knows (one registered with
+    ``FormatChecker.cls_checks``, say) kept. ``FormatChecker()`` alone
+    holds every draft's formats, and its ``time`` is draft 3's, which
+    rejects an RFC 3339 time such as ``19:47:52Z``."""
+    checker = jsonschema.FormatChecker()
+    checker.checkers.update(
+        jsonschema.Draft202012Validator.FORMAT_CHECKER.checkers
+    )
+    return checker
 
 
 def _normalize_to_wildcard(path: str) -> str:
