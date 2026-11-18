@@ -10,19 +10,25 @@ The format is based on Keep a Changelog.
 
 - With an OpenAPI `discriminator` next to `oneOf`/`anyOf`, the property it
   names gets the value that names the generated branch: its key in
-  `discriminator.mapping`, or, for a `$ref` branch the mapping does not
-  list, the name of the schema it refers to. It was a random string that
-  matched neither unless the branches pinned it with `const` or `enum`,
-  which still wins, as does a polymorphic branch's own level. Only the
-  value the branch was generated with is replaced: no property is added
-  and every other value stays the same. This needs the `$ref`s, so it
-  does not apply to a schema loaded with `Schema.from_oas` or
-  `Schema.from_raw_data` (issue #15).
-- A `str` selector finds a `$ref` branch through `discriminator.mapping`,
+  `discriminator.mapping`, or, for a branch the mapping does not list, the
+  name of the schema it stands for. It was a random string that matched
+  neither unless the branches pinned it with `const` or `enum`, which
+  still wins (so does `default`), as does a polymorphic branch's own
+  level. The value is written as soon as the property is generated, so
+  overrides and selectors that read it see the name; no property is added
+  and every other value stays the same. A mapping value may be a
+  reference, a file or a bare schema name. `Schema.from_oas` and
+  `Schema.from_raw_data` keep the names of `components/schemas`,
+  `definitions` and `$defs` as `x-schema-name`, and
+  `collect_variant_sites` labels the branches with the same names. With
+  `uniqueItems`, the discriminator values are drawn freely again once half
+  of the redraws are spent (issue #15).
+- A `str` selector finds a branch through `discriminator.mapping`,
   comparing the reference the branch was written with (resolved, so two
-  documents' `#/definitions/Pet` differ), and with a discriminator also by
-  the name of the schema it refers to; it raised "no candidate matched"
-  unless the schema had a `title`. The same limit applies (issue #15).
+  documents' `#/definitions/Pet` differ) before it falls back to a title,
+  and with a discriminator also by the name of the schema it stands for;
+  it raised "no candidate matched" unless the schema had a `title`
+  (issue #15).
 
 ## [0.6.0] - 2026-10-21
 
